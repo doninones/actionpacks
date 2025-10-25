@@ -1,0 +1,15 @@
+{
+  "name": "actionpacks",
+  "private": true,
+  "version": "0.0.0",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build": "npm -w @actionpacks/cli run build",
+    "dev": "npm -w @actionpacks/cli run dev",
+    "ci": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "typescript": "^5.6.3"
+  }
+}

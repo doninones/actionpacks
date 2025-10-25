@@ -1,0 +1,15 @@
+{
+  "createdAt": "2025-10-25T15:47:25.028Z",
+  "packs": [
+    {
+      "id": "issues-basic@1.0.0",
+      "version": "1.0.0",
+      "path": "/Users/donselimi/actionpacks/catalog/packs/issues-basic@1.0.0"
+    },
+    {
+      "id": "email-basic@1.0.0",
+      "version": "1.0.0",
+      "path": "/Users/donselimi/actionpacks/catalog/packs/email-basic@1.0.0"
+    }
+  ]
+}

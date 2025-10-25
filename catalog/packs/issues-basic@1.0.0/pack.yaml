@@ -1,0 +1,15 @@
+id: issues-basic@1.0.0
+name: Issues (Basic)
+capabilities: [ticket.create]
+security:
+  scopes: []
+tools:
+  - name: create_issue
+    schema: schemas/create_issue.json
+    x-actionpack:
+      side_effects: ["create"]
+      allowlist_fields: ["project_key"]
+      confirm_suggest:
+        - when: { field: "priority", equals: "Critical" }
+          message: "Confirm creating a Critical ticket."
+      rate_limit_suggest: { window: "1h", max_calls: 5, scope: "per_user_per_stack" }

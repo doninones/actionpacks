@@ -1,0 +1,11 @@
+id: email-basic@1.0.0
+name: Email (Basic)
+capabilities: [message.send]
+security:
+  scopes: []
+tools:
+  - name: send_email
+    schema: schemas/send_email.json
+    x-actionpack:
+      side_effects: ["send"]
+      allowlist_fields: []

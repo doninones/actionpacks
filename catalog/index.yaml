@@ -1,0 +1,5 @@
+packs:
+  - id: issues-basic@1.0.0
+    path: catalog/packs/issues-basic@1.0.0
+  - id: email-basic@1.0.0
+    path: catalog/packs/email-basic@1.0.0

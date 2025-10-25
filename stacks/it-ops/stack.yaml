@@ -1,0 +1,5 @@
+name: IT Ops
+env: staging
+packs:
+  - issues-basic@1.0.0
+  - email-basic@1.0.0

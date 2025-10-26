@@ -1,0 +1,22 @@
+name: Incident triage
+steps:
+  - tool: issues-basic@1.0.0:create_issue
+    input:
+      project_key: "IT"
+      title: "{{title}}"
+      description: "{{description}}"
+      priority: "{{priority}}"
+    save_as: ticket
+
+  - tool: email-basic@1.0.0:send_email
+    input:
+      to: "{{requester_email}}"
+      subject: "Ticket created: {{ticket.message}}"
+      body: >
+        We opened a ticket for you:
+        {{ticket.message}}
+
+  - tool: slack-basic@1.0.0:post_message
+    input:
+      channel: "#it"
+      text: "Opened: {{ticket.message}} (priority={{priority}})"

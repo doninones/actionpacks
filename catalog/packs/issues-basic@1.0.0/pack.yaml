@@ -8,7 +8,7 @@ tools:
     schema: schemas/create_issue.json
     x-actionpack:
       side_effects: ["create"]
-      allowlist_fields: ["project_key"]
+      allowlist_fields: ["project_key","title","description","priority","assignee"]
       confirm_suggest:
         - when: { field: "priority", equals: "Critical" }
           message: "Confirm creating a Critical ticket."

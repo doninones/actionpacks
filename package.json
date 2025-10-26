@@ -2,11 +2,14 @@
   "name": "actionpacks",
   "private": true,
   "version": "0.0.0",
-  "workspaces": ["packages/*"],
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "build": "npm -w @actionpacks/cli run build",
     "dev": "npm -w @actionpacks/cli run dev",
-    "ci": "npm run build"
+    "ci": "npm run build",
+    "export:mcp": "npm -w @actionpacks/cli run export:mcp"
   },
   "devDependencies": {
     "@types/node": "^20.12.12",

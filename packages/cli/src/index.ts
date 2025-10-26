@@ -484,4 +484,341 @@ program
     console.log('\nDry-run succeeded. This call would be allowed to execute by the host.');
   });
 
+/* ---------------------------
+ * exec (safe mock execution)
+ * ------------------------- */
+program
+  .command('exec')
+  .requiredOption('--tool <packId:toolName>', 'Tool selector, e.g., issues-basic@1.0.0:create_issue')
+  .option('--stack <path>', 'Stack path', 'stacks/it-ops')
+  .option('--catalog <path>', 'Catalog root', 'catalog')
+  .option('--json <payload>', 'Inline JSON payload')
+  .option('--file <path>', 'Path to a JSON file with the payload')
+  .option('--assume-yes', 'Assume confirmations are approved', false)
+  .option('--callsSoFar <n>', 'Simulate calls made in the current window', '0')
+  .description('Validate + (mock) execute a tool via adapters. No real side-effects.')
+  .action(async (opts) => {
+    // Reuse the exact same pipeline as dry-run, but proceed to mock-adapter when "ok"
+    const { packId, toolName } = parseToolSelector(opts.tool);
+
+    const stackDir = resolveStackDir(opts.stack);
+    const stackFile = path.join(stackDir, 'stack.yaml');
+    const lockFile = path.join(stackDir, 'stack.lock.json');
+    const policiesFile = path.join(stackDir, 'policies.yaml');
+
+    if (!fs.existsSync(stackFile) || !fs.existsSync(lockFile)) {
+      console.error(`Missing stack and/or lock. Run 'ap init …' and 'ap add …' first.`);
+      process.exit(1);
+    }
+    if (!fs.existsSync(policiesFile)) {
+      console.error(`Missing policies.yaml. Run: ap policies suggest --stack ${opts.stack}`);
+      process.exit(1);
+    }
+
+    const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8')) as LockFile;
+    const pol = loadYaml<Policies>(policiesFile);
+
+    const packLocked = lock.packs.find((p) => p.id === packId);
+    if (!packLocked) {
+      console.error(`Pack ${packId} not present in lockfile. Did you run 'ap add ${packId}'?`);
+      process.exit(1);
+    }
+
+    const packDir = packLocked.path;
+    const packYaml = path.join(packDir, 'pack.yaml');
+    if (!fs.existsSync(packYaml)) {
+      console.error(`pack.yaml not found at ${packYaml}`);
+      process.exit(1);
+    }
+    const meta = loadYaml<PackMeta>(packYaml);
+    const toolMeta = (meta.tools || []).find((t) => t.name === toolName);
+    if (!toolMeta) {
+      console.error(`Tool ${toolName} not found in ${packId}`);
+      process.exit(1);
+    }
+
+    // Load schema
+    const schemaPath = path.join(packDir, toolMeta.schema);
+    let schema: JsonSchema | null = null;
+    if (fs.existsSync(schemaPath)) {
+      try {
+        schema = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
+      } catch (e) {
+        console.warn(`Warn: schema parse failed for ${schemaPath}: ${(e as Error).message}`);
+      }
+    }
+
+    // Load payload
+    let payload: any = {};
+    if (opts.json && opts.file) {
+      console.error('Provide either --json or --file, not both.');
+      process.exit(1);
+    }
+    if (opts.json) {
+      try {
+        payload = JSON.parse(String(opts.json));
+      } catch (e) {
+        console.error(`Invalid JSON in --json: ${(e as Error).message}`);
+        process.exit(1);
+      }
+    } else if (opts.file) {
+      const p = path.resolve(process.cwd(), String(opts.file));
+      try {
+        payload = JSON.parse(fs.readFileSync(p, 'utf8'));
+      } catch (e) {
+        console.error(`Invalid JSON file ${p}: ${(e as Error).message}`);
+        process.exit(1);
+      }
+    } else {
+      console.error('No payload given. Provide --json or --file.');
+      process.exit(1);
+    }
+
+    // 1) Schema validation
+    const issues: string[] = [];
+    if (schema) {
+      const ajv = new Ajv({ allErrors: true, strict: false });
+      addFormats(ajv);
+      const validate = ajv.compile(schema as any);
+      const ok = validate(payload);
+      if (!ok) {
+        for (const err of validate.errors || []) {
+          issues.push(`schema: ${err.instancePath || '/'} ${err.message}`);
+        }
+      }
+    }
+
+    // 2) Policies enforcement
+    const rule =
+      pol.rules.find((r) => r.pack === packId && r.tool === toolName) ||
+      pol.rules.find((r) => r.pack.startsWith(packId.split('@')[0] + '@') && r.tool === toolName);
+
+    let needsConfirm = false;
+    let confirmMessage = '';
+    let allowlist: string[] = [];
+    let rateLimit = { maxCalls: 20, windowSec: 60 };
+
+    if (rule) {
+      needsConfirm = !!rule.confirm?.required;
+      confirmMessage = rule.confirm?.message || `Proceed with ${toolName}?`;
+      allowlist = rule.allowlist || [];
+      if (rule.rateLimit) rateLimit = rule.rateLimit;
+    }
+
+    if (allowlist.length > 0) {
+      const bad = Object.keys(payload).filter((k) => !allowlist.includes(k));
+      if (bad.length) issues.push(`allowlist: unexpected fields ${bad.join(', ')}`);
+    }
+
+    const callsSoFar = Math.max(0, parseInt(String(opts.callsSoFar), 10) || 0);
+    const wouldExceed = callsSoFar + 1 > rateLimit.maxCalls;
+
+    if (issues.length) {
+      console.log('❌ Validation failed:\n' + issues.map((i) => ' - ' + i).join('\n'));
+      process.exit(1);
+    }
+    if (wouldExceed) {
+      console.log(
+        `⛔ Rate limit would be exceeded (${callsSoFar + 1}/${rateLimit.maxCalls} within ${rateLimit.windowSec}s).`,
+      );
+      process.exit(1);
+    }
+    if (needsConfirm && !opts.assumeYes) {
+      console.log(`⚠️  Confirmation required: "${confirmMessage}" (rerun with --assume-yes)`);
+      process.exit(2);
+    }
+
+    // 3) Mock adapters — NO real side-effects, just a deterministic result.
+    type ExecResult = { ok: true; echo: any; message: string; tool: string; pack: string };
+    const adapters: Record<string, (payload: any) => ExecResult> = {
+      'issues-basic@1.0.0:create_issue': (pl) => ({
+        ok: true,
+        echo: pl,
+        tool: 'create_issue',
+        pack: 'issues-basic@1.0.0',
+        message: `Simulated ticket creation: "${pl.title}" in project "${pl.project_key}"`,
+      }),
+      'email-basic@1.0.0:send_email': (pl) => ({
+        ok: true,
+        echo: pl,
+        tool: 'send_email',
+        pack: 'email-basic@1.0.0',
+        message: `Simulated email to ${pl.to} with subject "${pl.subject}"`,
+      }),
+    };
+
+    const key = `${packId}:${toolName}`;
+    const adapter = adapters[key];
+    if (!adapter) {
+      console.log(
+        `ℹ️ No adapter for ${key}. This is expected in the PoC—add one to 'adapters' when you wire a real integration.`,
+      );
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            simulated: true,
+            tool: toolName,
+            pack: packId,
+            payload,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+
+    const result = adapter(payload);
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+/* ---------------------------
+ * export (MCP bundle)
+ * ------------------------- */
+program
+  .command('export')
+  .description('Export a stack into a portable bundle')
+  .option('--stack <path>', 'Stack path', 'stacks/it-ops')
+  .option('--format <fmt>', 'Export format (mcp)', 'mcp')
+  .option('--out <dir>', 'Output directory (e.g., dist/it-ops-mcp)')
+  .action((opts) => {
+    const fmt = String(opts.format || 'mcp').toLowerCase();
+    if (fmt !== 'mcp') {
+      console.error(`Unsupported --format ${fmt}. Only "mcp" is supported right now.`);
+      process.exit(1);
+    }
+
+    const stackDir = resolveStackDir(opts.stack);
+    const stackFile = path.join(stackDir, 'stack.yaml');
+    const lockFile = path.join(stackDir, 'stack.lock.json');
+    const policiesFile = path.join(stackDir, 'policies.yaml');
+
+    if (!fs.existsSync(stackFile)) {
+      console.error(`Missing ${stackFile}. Run: ap init ${opts.stack}`);
+      process.exit(1);
+    }
+    if (!fs.existsSync(lockFile)) {
+      console.error(`Missing ${lockFile}. Run: ap add <pack@ver> --stack ${opts.stack}`);
+      process.exit(1);
+    }
+
+    const stack = loadYaml<StackFile>(stackFile);
+    const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8')) as LockFile;
+
+    // Decide an output directory (anchor to repo root via the stack dir)
+    const repoRoot = path.resolve(stackDir, '..', '..');
+    let outDir: string;
+    if (opts.out) {
+      outDir = path.isAbsolute(opts.out)
+        ? opts.out
+        : path.join(repoRoot, opts.out);
+    } else {
+      const defaultName = `${(stack.name || 'stack').toLowerCase().replace(/\s+/g, '-')}-mcp`;
+      outDir = path.join(repoRoot, 'dist', defaultName);
+    }
+    fs.mkdirSync(outDir, { recursive: true });
+
+    // Create standard folders
+    const toolsDir = path.join(outDir, 'tools');
+    const govDir = path.join(outDir, 'governance');
+    const cfgDir = path.join(outDir, 'config');
+    fs.mkdirSync(toolsDir, { recursive: true });
+    fs.mkdirSync(govDir, { recursive: true });
+    fs.mkdirSync(cfgDir, { recursive: true });
+
+    // Copy policies.yaml if present
+    let policiesRel = '';
+    if (fs.existsSync(policiesFile)) {
+      const dest = path.join(govDir, 'policies.yaml');
+      fs.copyFileSync(policiesFile, dest);
+      policiesRel = 'governance/policies.yaml';
+    }
+
+    // Always copy stack.yaml for context
+    fs.copyFileSync(stackFile, path.join(cfgDir, 'stack.yaml'));
+
+    // Build manifest
+    const manifest: any = {
+      format: 'mcp',
+      exportedAt: new Date().toISOString(),
+      stack: { name: stack.name, env: stack.env },
+      governance: policiesRel ? { policies: policiesRel } : {},
+      packs: [] as any[]
+    };
+
+    // For each pack in stack, copy tool schemas and collect metadata
+    for (const packId of (stack.packs || [])) {
+      const locked = lock.packs.find(p => p.id === packId);
+      if (!locked) {
+        console.warn(`Warning: ${packId} is in stack but not in lockfile—skipping.`);
+        continue;
+      }
+      const packDir = locked.path; // absolute path to catalog pack
+      const metaPath = path.join(packDir, 'pack.yaml');
+      if (!fs.existsSync(metaPath)) {
+        console.warn(`Warning: Missing pack.yaml for ${packId} at ${metaPath}—skipping.`);
+        continue;
+      }
+
+      const meta = loadYaml<PackMeta>(metaPath);
+      const packOutDir = path.join(toolsDir, packId.replace(/\//g, '_'));
+      fs.mkdirSync(packOutDir, { recursive: true });
+
+      const tools: any[] = [];
+      for (const t of (meta.tools ?? [])) {
+        const schemaAbs = path.join(packDir, t.schema);
+        if (!fs.existsSync(schemaAbs)) {
+          console.warn(`Warning: Missing schema for ${packId}:${t.name} at ${schemaAbs}—skipping tool.`);
+          continue;
+        }
+        const schemaRel = path.join('tools', packId.replace(/\//g, '_'), `${t.name}.json`);
+        const schemaOut = path.join(outDir, schemaRel);
+        fs.copyFileSync(schemaAbs, schemaOut);
+
+        tools.push({
+          name: t.name,
+          schema: schemaRel,
+          side_effects: t['x-actionpack']?.side_effects ?? [],
+          allowlist: t['x-actionpack']?.allowlist_fields ?? []
+        });
+      }
+
+      manifest.packs.push({
+        id: packId,
+        name: meta.name ?? undefined,
+        capabilities: meta.capabilities ?? [],
+        tools
+      });
+    }
+
+    // Write manifest
+    fs.writeFileSync(path.join(outDir, 'actionpack.json'), JSON.stringify(manifest, null, 2), 'utf8');
+
+    // Write README
+    const readme = `# ${stack.name} – MCP Export
+
+This folder is a **generated** ActionPacks bundle in **MCP** format.
+
+## Contents
+- \`actionpack.json\`: manifest with packs, tools, and schema references
+- \`tools/\`: JSON Schemas for each tool
+- \`governance/policies.yaml\`: (optional) governance rules copied from the stack
+- \`config/stack.yaml\`: the original stack definition (for context)
+
+## Using with an MCP host
+Point your host at this folder and register the tools listed in \`actionpack.json\`.
+Each tool lists a \`schema\` path (under \`tools/\`) and optional governance hints
+(\`allowlist\`, \`side_effects\`). Enforcement is host-defined.
+
+> Note: this bundle contains **no executable integrations**—it’s a portable description.
+`;
+    fs.writeFileSync(path.join(outDir, 'README.md'), readme, 'utf8');
+
+    console.log(`\nExported MCP bundle to: ${outDir}`);
+    console.log(`- Manifest: ${path.join(outDir, 'actionpack.json')}`);
+    if (policiesRel) console.log(`- Policies: ${path.join(outDir, policiesRel)}`);
+    console.log('- Tool schemas placed under tools/');
+  });
+
 program.parseAsync();

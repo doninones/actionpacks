@@ -4,3 +4,5 @@ out
 *.tsbuildinfo
 .DS_Store
 dist/
+/dist/
+/packages/cli/dist/

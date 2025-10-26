@@ -5,6 +5,8 @@ import path from 'path';
 import yaml from 'js-yaml';
 import Ajv from 'ajv';
 import addFormats from 'ajv-formats';
+import crypto from 'crypto';
+import yazl from 'yazl';
 
 const program = new Command();
 program.name('ap').description('ActionPacks CLI (PoC)').version('0.4.0');
@@ -1230,6 +1232,90 @@ program
     console.log('Summary: bundle looks good ✅');
   });
 
+/* ---------------------------
+ * publish (package MCP bundle as a ZIP)
+ * ------------------------- */
+program
+  .command('publish')
+  .description('Zip an MCP export, write checksum, and stage release artifacts')
+  .requiredOption('--bundle <dir>', 'Exported bundle directory (e.g., dist/it-ops-mcp)')
+  .option('--dest <dir>', 'Output folder for release assets', 'dist/releases')
+  .action(async (opts) => {
+    const bundleDir = path.resolve(process.cwd(), String(opts.bundle));
+    const destDir = path.resolve(process.cwd(), String(opts.dest));
+
+    const manifestPath = path.join(bundleDir, 'actionpack.json');
+    if (!fs.existsSync(bundleDir)) {
+      console.error(`Bundle directory not found: ${bundleDir}`);
+      process.exit(1);
+    }
+    if (!fs.existsSync(manifestPath)) {
+      console.error(`Missing manifest: ${manifestPath}`);
+      process.exit(1);
+    }
+
+    // Load manifest to name the file.
+    let manifest: any;
+    try {
+      manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    } catch (e) {
+      console.error(`Invalid JSON in manifest: ${(e as Error).message}`);
+      process.exit(1);
+    }
+    const stackName = (manifest?.stack?.name ?? 'stack')
+      .toLowerCase()
+      .replace(/\s+/g, '-')
+      .replace(/[^a-z0-9\-]/g, '');
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const zipName = `${stackName}-mcp-${timestamp}.zip`;
+
+    fs.mkdirSync(destDir, { recursive: true });
+    const zipPath = path.join(destDir, zipName);
+
+    // Zip the bundle directory
+    const ZipFile = (yazl as any).ZipFile;
+    const zip = new ZipFile();
+
+    function addDir(baseAbs: string, rel = '') {
+      const abs = path.join(baseAbs, rel);
+      const entries = fs.readdirSync(abs, { withFileTypes: true });
+      for (const ent of entries) {
+        const relPath = path.join(rel, ent.name);
+        const absPath = path.join(baseAbs, relPath);
+        if (ent.isDirectory()) {
+          // ensure directory entry for empty dirs
+          zip.addEmptyDirectory(relPath.replace(/\\/g, '/') + '/');
+          addDir(baseAbs, relPath);
+        } else if (ent.isFile()) {
+          zip.addFile(absPath, relPath.replace(/\\/g, '/'));
+        }
+      }
+    }
+
+    addDir(bundleDir);
+    await new Promise<void>((resolve, reject) => {
+      zip.outputStream
+        .pipe(fs.createWriteStream(zipPath))
+        .on('close', () => resolve())
+        .on('error', reject);
+      zip.end();
+    });
+
+    // SHA256 checksum
+    const sha = crypto.createHash('sha256').update(fs.readFileSync(zipPath)).digest('hex');
+    const checksumsPath = path.join(destDir, 'checksums.txt');
+    const line = `${sha}  ${path.basename(zipPath)}\n`;
+    fs.appendFileSync(checksumsPath, line, 'utf8');
+
+    // Copy manifest next to the zip for quick inspection
+    const manifestCopy = path.join(destDir, `${stackName}-actionpack.json`);
+    fs.copyFileSync(manifestPath, manifestCopy);
+
+    console.log('\nPublish complete ✅');
+    console.log(`ZIP:        ${zipPath}`);
+    console.log(`Checksum:   ${checksumsPath}`);
+    console.log(`Manifest:   ${manifestCopy}`);
+  });
 
 
 program.parseAsync();

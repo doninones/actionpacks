@@ -9,7 +9,8 @@
     "build": "npm -w @actionpacks/cli run build",
     "dev": "npm -w @actionpacks/cli run dev",
     "ci": "npm run build",
-    "export:mcp": "npm -w @actionpacks/cli run export:mcp"
+    "export:mcp": "npm -w @actionpacks/cli run export:mcp",
+    "publish:mcp": "npm -w @actionpacks/cli run dev -- publish --bundle ../../dist/it-ops-mcp --dest ../../dist/releases"
   },
   "devDependencies": {
     "@types/node": "^20.12.12",

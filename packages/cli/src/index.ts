@@ -3,9 +3,11 @@ import { Command } from 'commander';
 import fs from 'fs';
 import path from 'path';
 import yaml from 'js-yaml';
+import Ajv from 'ajv';
+import addFormats from 'ajv-formats';
 
 const program = new Command();
-program.name('ap').description('ActionPacks CLI (PoC)').version('0.3.0');
+program.name('ap').description('ActionPacks CLI (PoC)').version('0.4.0');
 
 type CatalogIndex = { packs: { id: string; path: string }[] };
 type StackFile = { name: string; packs: string[]; env?: string };
@@ -16,7 +18,7 @@ type PackMeta = {
   capabilities?: string[];
   tools?: {
     name: string;
-    schema: string; // relative path to JSON schema
+    schema: string; // relative path to JSON schema from pack root
     ['x-actionpack']?: {
       side_effects?: string[];
       allowlist_fields?: string[];
@@ -29,6 +31,19 @@ type JsonSchema = {
   properties?: Record<string, any>;
   required?: string[];
   description?: string;
+};
+
+type Policies = {
+  generatedAt?: string;
+  stack?: string;
+  rules: Array<{
+    pack: string;
+    tool: string;
+    description?: string;
+    confirm?: { message?: string; required?: boolean };
+    allowlist?: string[];
+    rateLimit?: { maxCalls: number; windowSec: number };
+  }>;
 };
 
 function loadYaml<T = any>(p: string): T {
@@ -63,6 +78,14 @@ function parsePackId(packId: string) {
   const at = packId.lastIndexOf('@');
   if (at <= 0) return { name: packId, version: 'latest' };
   return { name: packId.slice(0, at), version: packId.slice(at + 1) };
+}
+function parseToolSelector(sel: string): { packId: string; toolName: string } {
+  const i = sel.indexOf(':');
+  if (i <= 0) {
+    console.error(`Invalid --tool selector "${sel}". Use: <packId>:<toolName>`);
+    process.exit(1);
+  }
+  return { packId: sel.slice(0, i), toolName: sel.slice(i + 1) };
 }
 
 /* ---------------------------
@@ -224,10 +247,10 @@ program
     const defaultLimit = Math.max(1, parseInt(String(opts.rateLimit), 10));
     const defaultWindow = Math.max(1, parseInt(String(opts.windowSec), 10));
 
-    const out: any = {
+    const out: Policies = {
       generatedAt: new Date().toISOString(),
       stack: stack.name || path.basename(stackDir),
-      rules: [] as any[],
+      rules: [],
     };
 
     for (const p of lock.packs) {
@@ -240,7 +263,6 @@ program
       const meta = loadYaml<PackMeta>(packYaml);
 
       for (const tool of meta.tools || []) {
-        // load schema if present
         const schemaPath = path.join(packDir, tool.schema);
         let schema: JsonSchema | null = null;
         if (fs.existsSync(schemaPath)) {
@@ -251,37 +273,215 @@ program
           }
         }
 
-        // Heuristics:
-        // 1) confirmations if side_effects indicate action (send|create|update|delete|write|post)
         const se = (tool['x-actionpack']?.side_effects || []).map((s) => String(s).toLowerCase());
         const needsConfirm = se.some((s) =>
           ['send', 'create', 'update', 'delete', 'write', 'post'].includes(s),
         );
 
-        // 2) allowlists: use allowlist_fields, else infer safe props from schema
         const explicitAllow = tool['x-actionpack']?.allowlist_fields || [];
         const schemaProps = schema?.properties ? Object.keys(schema.properties) : [];
         const inferredAllow = schemaProps.filter(
           (k) => !/(password|secret|token|apikey|api_key|auth|bearer|credential)/i.test(k),
         );
 
-        // 3) rate limits: default per tool
-        const rule: any = {
+        out.rules.push({
           pack: p.id,
           tool: tool.name,
           confirm: needsConfirm ? { message: `Proceed with ${tool.name}?`, required: true } : { required: false },
           allowlist: explicitAllow.length ? explicitAllow : inferredAllow,
           rateLimit: { maxCalls: defaultLimit, windowSec: defaultWindow },
-        };
-        if (schema?.description) rule.description = schema.description;
-
-        out.rules.push(rule);
+          description: schema?.description,
+        });
       }
     }
 
     const dest = path.join(stackDir, 'policies.yaml');
     saveYaml(dest, out);
     console.log(`Generated ${dest}`);
+  });
+
+/* ---------------------------
+ * dry-run
+ * ------------------------- */
+program
+  .command('dry-run')
+  .requiredOption('--tool <packId:toolName>', 'Tool selector, e.g., issues-basic@1.0.0:create_issue')
+  .option('--stack <path>', 'Stack path', 'stacks/it-ops')
+  .option('--catalog <path>', 'Catalog root', 'catalog')
+  .option('--json <payload>', 'Inline JSON payload')
+  .option('--file <path>', 'Path to a JSON file with the payload')
+  .option('--assume-yes', 'Assume confirmations are approved', false)
+  .option('--callsSoFar <n>', 'Simulate calls made in the current window', '0')
+  .description('Validate input against schema, enforce policies, and print a no-side-effects call preview')
+  .action((opts) => {
+    const { packId, toolName } = parseToolSelector(opts.tool);
+
+    const stackDir = resolveStackDir(opts.stack);
+    const stackFile = path.join(stackDir, 'stack.yaml');
+    const lockFile = path.join(stackDir, 'stack.lock.json');
+    const policiesFile = path.join(stackDir, 'policies.yaml');
+
+    if (!fs.existsSync(stackFile) || !fs.existsSync(lockFile)) {
+      console.error(`Missing stack and/or lock. Run 'ap init …' and 'ap add …' first.`);
+      process.exit(1);
+    }
+    if (!fs.existsSync(policiesFile)) {
+      console.error(`Missing policies.yaml. Run: ap policies suggest --stack ${opts.stack}`);
+      process.exit(1);
+    }
+
+    const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8')) as LockFile;
+    const pol = loadYaml<Policies>(policiesFile);
+
+    const packLocked = lock.packs.find((p) => p.id === packId);
+    if (!packLocked) {
+      console.error(`Pack ${packId} not present in lockfile. Did you run 'ap add ${packId}'?`);
+      process.exit(1);
+    }
+
+    const packDir = packLocked.path;
+    const packYaml = path.join(packDir, 'pack.yaml');
+    if (!fs.existsSync(packYaml)) {
+      console.error(`pack.yaml not found at ${packYaml}`);
+      process.exit(1);
+    }
+    const meta = loadYaml<PackMeta>(packYaml);
+    const toolMeta = (meta.tools || []).find((t) => t.name === toolName);
+    if (!toolMeta) {
+      console.error(`Tool ${toolName} not found in ${packId}`);
+      process.exit(1);
+    }
+
+    // Load schema
+    const schemaPath = path.join(packDir, toolMeta.schema);
+    let schema: JsonSchema | null = null;
+    if (fs.existsSync(schemaPath)) {
+      try {
+        schema = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
+      } catch (e) {
+        console.warn(`Warn: schema parse failed for ${schemaPath}: ${(e as Error).message}`);
+      }
+    }
+
+    // Load payload
+    let payload: any = {};
+    if (opts.json && opts.file) {
+      console.error('Provide either --json or --file, not both.');
+      process.exit(1);
+    }
+    if (opts.json) {
+      try {
+        payload = JSON.parse(String(opts.json));
+      } catch (e) {
+        console.error(`Invalid JSON in --json: ${(e as Error).message}`);
+        process.exit(1);
+      }
+    } else if (opts.file) {
+      const p = path.resolve(process.cwd(), String(opts.file));
+      try {
+        payload = JSON.parse(fs.readFileSync(p, 'utf8'));
+      } catch (e) {
+        console.error(`Invalid JSON file ${p}: ${(e as Error).message}`);
+        process.exit(1);
+      }
+    } else {
+      console.error('No payload given. Provide --json or --file.');
+      process.exit(1);
+    }
+
+    // 1) Schema validation (if schema present)
+    const issues: string[] = [];
+    if (schema) {
+      const ajv = new Ajv({ allErrors: true, strict: false });
+      addFormats(ajv);
+      const validate = ajv.compile(schema as any);
+      const ok = validate(payload);
+      if (!ok) {
+        for (const err of validate.errors || []) {
+          issues.push(`schema: ${err.instancePath || '/'} ${err.message}`);
+        }
+      }
+    }
+
+    // 2) Policies enforcement
+    // Find matching rule
+    const rule =
+      pol.rules.find((r) => r.pack === packId && r.tool === toolName) ||
+      pol.rules.find((r) => r.pack.startsWith(packId.split('@')[0] + '@') && r.tool === toolName);
+
+    let needsConfirm = false;
+    let confirmMessage = '';
+    let allowlist: string[] = [];
+    let rateLimit = { maxCalls: 20, windowSec: 60 };
+
+    if (rule) {
+      needsConfirm = !!rule.confirm?.required;
+      confirmMessage = rule.confirm?.message || `Proceed with ${toolName}?`;
+      allowlist = rule.allowlist || [];
+      if (rule.rateLimit) rateLimit = rule.rateLimit;
+    } else {
+      // No rule: default conservative (no allowlist block, no confirm)
+      allowlist = [];
+      needsConfirm = false;
+    }
+
+    // allowlist enforcement: if allowlist given, ensure payload keys are subset
+    if (allowlist.length > 0) {
+      const bad = Object.keys(payload).filter((k) => !allowlist.includes(k));
+      if (bad.length) issues.push(`allowlist: unexpected fields ${bad.join(', ')}`);
+    }
+
+    // rate limit simulation
+    const callsSoFar = Math.max(0, parseInt(String(opts.callsSoFar), 10) || 0);
+    const wouldExceed = callsSoFar + 1 > rateLimit.maxCalls;
+
+    // 3) Output preview
+    const preview = {
+      status:
+        issues.length > 0
+          ? 'blocked'
+          : needsConfirm && !opts.assumeYes
+          ? 'needs-confirmation'
+          : wouldExceed
+          ? 'rate-limited'
+          : 'ok',
+      pack: packId,
+      tool: toolName,
+      packPath: packDir,
+      schema: schemaPath,
+      policies: {
+        confirmRequired: needsConfirm,
+        confirmMessage,
+        allowlist,
+        rateLimit,
+        callsSoFar,
+        wouldExceed,
+      },
+      payload, // echo back
+    };
+
+    // Pretty print
+    console.log('--- DRY RUN ---');
+    console.log(JSON.stringify(preview, null, 2));
+
+    if (issues.length) {
+      console.log('\nPolicy/Schema issues:');
+      for (const i of issues) console.log(' -', i);
+      process.exit(1);
+    }
+    if (wouldExceed) {
+      console.log(
+        `\nRate limit would be exceeded (${callsSoFar + 1}/${rateLimit.maxCalls} within ${rateLimit.windowSec}s).`,
+      );
+      process.exit(1);
+    }
+    if (needsConfirm && !opts.assumeYes) {
+      console.log(`\nConfirmation required: "${confirmMessage}" (use --assume-yes to bypass in dry-run)`);
+      // still exit non-zero to indicate action not yet allowed
+      process.exit(2);
+    }
+
+    console.log('\nDry-run succeeded. This call would be allowed to execute by the host.');
   });
 
 program.parseAsync();

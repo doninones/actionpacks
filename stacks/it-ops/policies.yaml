@@ -1,4 +1,4 @@
-generatedAt: '2025-10-26T15:14:26.612Z'
+generatedAt: '2025-10-26T15:21:10.303Z'
 stack: IT Ops
 rules:
   - pack: issues-basic@1.0.0
@@ -8,6 +8,10 @@ rules:
       required: true
     allowlist:
       - project_key
+      - title
+      - description
+      - priority
+      - assignee
     rateLimit:
       maxCalls: 20
       windowSec: 60

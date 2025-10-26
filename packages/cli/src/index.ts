@@ -1129,5 +1129,107 @@ program
     console.log(`Updated ${lockPath}`);
   });
 
+/* ---------------------------
+ * verify (MCP bundle)
+ * ------------------------- */
+program
+  .command('verify')
+  .description('Verify an exported MCP bundle (paths + JSON Schemas)')
+  .requiredOption('--bundle <dir>', 'Path to MCP export folder (e.g., dist/it-ops-mcp)')
+  .action((opts) => {
+    const bundleDir = path.resolve(process.cwd(), String(opts.bundle));
+    const manifestPath = path.join(bundleDir, 'actionpack.json');
+
+    if (!fs.existsSync(bundleDir)) {
+      console.error(`Bundle directory not found: ${bundleDir}`);
+      process.exit(1);
+    }
+    if (!fs.existsSync(manifestPath)) {
+      console.error(`Missing manifest: ${manifestPath}`);
+      process.exit(1);
+    }
+
+    // Load manifest
+    let manifest: any;
+    try {
+      manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    } catch (e) {
+      console.error(`Invalid JSON in manifest: ${(e as Error).message}`);
+      process.exit(1);
+    }
+
+    const errs: string[] = [];
+    const warns: string[] = [];
+    const infos: string[] = [];
+
+    // Governance check (optional)
+    if (manifest?.governance?.policies) {
+      const polAbs = path.join(bundleDir, manifest.governance.policies);
+      if (!fs.existsSync(polAbs)) {
+        errs.push(`governance.policies not found: ${polAbs}`);
+      } else {
+        infos.push(`Found governance policies: ${manifest.governance.policies}`);
+      }
+    }
+
+    // Prepare Ajv
+    const ajv = new Ajv({ allErrors: true, strict: false });
+    addFormats(ajv);
+
+    // Tools & schemas
+    const packs = Array.isArray(manifest?.packs) ? manifest.packs : [];
+    if (!packs.length) warns.push('No packs listed in manifest.');
+
+    for (const p of packs) {
+      const tools = Array.isArray(p?.tools) ? p.tools : [];
+      if (!tools.length) {
+        warns.push(`Pack ${p?.id ?? '(unknown)'} has no tools.`);
+      }
+      for (const t of tools) {
+        const schemaRel = t?.schema;
+        if (!schemaRel || typeof schemaRel !== 'string') {
+          errs.push(`Pack ${p?.id}: tool ${t?.name} missing "schema" path.`);
+          continue;
+        }
+        const schemaAbs = path.join(bundleDir, schemaRel);
+        if (!fs.existsSync(schemaAbs)) {
+          errs.push(`Schema not found: ${schemaRel} (resolved ${schemaAbs})`);
+          continue;
+        }
+
+        // Compile schema
+        try {
+          const s = JSON.parse(fs.readFileSync(schemaAbs, 'utf8'));
+          ajv.compile(s); // throws on invalid schema
+          infos.push(`OK schema: ${schemaRel}`);
+        } catch (e) {
+          errs.push(`Invalid schema ${schemaRel}: ${(e as Error).message}`);
+        }
+      }
+    }
+
+    // Report
+    console.log('\n=== Verify Report ===\n');
+    if (infos.length) {
+      console.log('Info:');
+      for (const i of infos) console.log('•', i);
+      console.log();
+    }
+    if (warns.length) {
+      console.log('Warnings:');
+      for (const w of warns) console.log('•', w);
+      console.log();
+    }
+    if (errs.length) {
+      console.log('Errors:');
+      for (const e of errs) console.log('•', e);
+      console.log();
+      process.exit(1);
+    }
+
+    console.log('Summary: bundle looks good ✅');
+  });
+
+
 
 program.parseAsync();

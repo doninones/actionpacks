@@ -1,0 +1,26 @@
+generatedAt: '2025-10-26T15:14:26.612Z'
+stack: IT Ops
+rules:
+  - pack: issues-basic@1.0.0
+    tool: create_issue
+    confirm:
+      message: Proceed with create_issue?
+      required: true
+    allowlist:
+      - project_key
+    rateLimit:
+      maxCalls: 20
+      windowSec: 60
+    description: Create a basic issue/ticket.
+  - pack: email-basic@1.0.0
+    tool: send_email
+    confirm:
+      message: Proceed with send_email?
+      required: true
+    allowlist:
+      - to
+      - subject
+      - body
+    rateLimit:
+      maxCalls: 20
+      windowSec: 60

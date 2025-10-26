@@ -1,4 +1,4 @@
-generatedAt: '2025-10-26T16:26:10.283Z'
+generatedAt: '2025-10-26T18:57:17.202Z'
 stack: IT Ops
 rules:
   - pack: issues-basic@1.0.0
@@ -28,3 +28,15 @@ rules:
     rateLimit:
       maxCalls: 20
       windowSec: 60
+  - pack: slack-basic@1.0.0
+    tool: post_message
+    confirm:
+      message: Proceed with post_message?
+      required: true
+    allowlist:
+      - channel
+      - text
+    rateLimit:
+      maxCalls: 20
+      windowSec: 60
+    description: Post a basic Slack message to a channel.

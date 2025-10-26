@@ -1,0 +1,8 @@
+name: Slack (Basic)
+capabilities: [message.send]
+tools:
+  - name: post_message
+    schema: schemas/post_message.json
+    x-actionpack:
+      side_effects: [send]
+      allowlist_fields: [channel, text]

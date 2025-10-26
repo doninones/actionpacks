@@ -1,5 +1,7 @@
 packs:
   - id: issues-basic@1.0.0
-    path: catalog/packs/issues-basic@1.0.0
+    path: packs/issues-basic@1.0.0
   - id: email-basic@1.0.0
-    path: catalog/packs/email-basic@1.0.0
+    path: packs/email-basic@1.0.0
+  - id: slack-basic@1.0.0
+    path: packs/slack-basic@1.0.0

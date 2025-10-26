@@ -10,6 +10,11 @@
       "id": "email-basic@1.0.0",
       "version": "1.0.0",
       "path": "/Users/donselimi/actionpacks/catalog/packs/email-basic@1.0.0"
+    },
+    {
+      "id": "slack-basic@1.0.0",
+      "version": "1.0.0",
+      "path": "/Users/donselimi/actionpacks/catalog/packs/slack-basic@1.0.0"
     }
   ]
 }

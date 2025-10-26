@@ -1,0 +1,9 @@
+{
+  "type":"object",
+  "required":["channel","text"],
+  "properties":{
+    "channel":{"type":"string","minLength":1},
+    "text":{"type":"string","minLength":1}
+  },
+  "description":"Post a basic Slack message to a channel."
+}

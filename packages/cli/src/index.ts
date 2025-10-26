@@ -821,4 +821,172 @@ Each tool lists a \`schema\` path (under \`tools/\`) and optional governance hin
     console.log('- Tool schemas placed under tools/');
   });
 
+/* ---------------------------
+ * lint (validate stack + lock + packs + schemas + policies)
+ * ------------------------- */
+program
+  .command('lint')
+  .description('Validate stack, lockfile, pack metadata, tool schemas, and policies')
+  .option('--stack <path>', 'Stack path', 'stacks/it-ops')
+  .option('--catalog <path>', 'Catalog root', 'catalog')
+  .action((opts) => {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    const info: string[] = [];
+
+    const pushErr = (m: string) => errors.push(`✖ ${m}`);
+    const pushWarn = (m: string) => warnings.push(`⚠ ${m}`);
+    const pushInfo = (m: string) => info.push(`• ${m}`);
+
+    const print = (arr: string[]) => arr.forEach(m => console.log(m));
+    const printAndExit = () => {
+      console.log('\n=== Lint Report ===');
+      if (info.length) { console.log('\nInfo:'); print(info); }
+      if (warnings.length) { console.log('\nWarnings:'); print(warnings); }
+      if (errors.length) { console.log('\nErrors:'); print(errors); }
+      console.log('\nSummary:',
+        `${errors.length} error(s),`,
+        `${warnings.length} warning(s),`,
+        `${info.length} info.`);
+      process.exit(errors.length ? 1 : 0);
+    };
+
+    // 1) Stack files
+    const stackDir = resolveStackDir(opts.stack);
+    const stackFile = path.join(stackDir, 'stack.yaml');
+    const lockFile = path.join(stackDir, 'stack.lock.json');
+    const policiesFile = path.join(stackDir, 'policies.yaml');
+
+    if (!fs.existsSync(stackFile)) pushErr(`Missing ${stackFile}`);
+    if (!fs.existsSync(lockFile)) pushErr(`Missing ${lockFile}`);
+
+    if (errors.length) {
+      // Hard stop if the core files aren’t there
+      printAndExit();
+      return;
+    }
+
+    const stack = loadYaml<StackFile>(stackFile);
+    const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8')) as LockFile;
+
+    if (!stack?.packs?.length) pushWarn(`Stack has no packs listed in ${stackFile}`);
+
+    // 2) Ensure each stack pack is in lock + on disk
+    const lockedById = new Map(lock.packs.map(p => [p.id, p]));
+    for (const packId of (stack.packs || [])) {
+      const lp = lockedById.get(packId);
+      if (!lp) {
+        pushErr(`Pack ${packId} is in stack.yaml but not in stack.lock.json`);
+        continue;
+      }
+      if (!fs.existsSync(lp.path)) {
+        pushErr(`Pack path missing on disk: ${lp.path} (from lockfile)`);
+      } else {
+        pushInfo(`Found ${packId} at ${lp.path}`);
+      }
+    }
+
+    // 3) Validate pack.yaml + tool schemas
+    const ajv = new Ajv({ allErrors: true, strict: false });
+    addFormats(ajv);
+
+    type ToolRef = { packId: string; toolName: string; schemaPath?: string; props: string[] };
+    const stackTools: ToolRef[] = [];
+
+    for (const packId of (stack.packs || [])) {
+      const lp = lockedById.get(packId);
+      if (!lp || !fs.existsSync(lp.path)) continue;
+
+      const packYamlPath = path.join(lp.path, 'pack.yaml');
+      if (!fs.existsSync(packYamlPath)) {
+        pushErr(`Missing pack.yaml for ${packId} at ${packYamlPath}`);
+        continue;
+      }
+      let meta: PackMeta;
+      try {
+        meta = loadYaml<PackMeta>(packYamlPath);
+      } catch (e) {
+        pushErr(`Failed to parse pack.yaml for ${packId}: ${(e as Error).message}`);
+        continue;
+      }
+
+      for (const t of meta.tools || []) {
+        const schemaAbs = path.join(lp.path, t.schema);
+        if (!fs.existsSync(schemaAbs)) {
+          pushErr(`Missing schema for ${packId}:${t.name} at ${schemaAbs}`);
+          continue;
+        }
+        // Parse + compile schema
+        let schema: any;
+        try {
+          schema = JSON.parse(fs.readFileSync(schemaAbs, 'utf8'));
+        } catch (e) {
+          pushErr(`Invalid JSON schema for ${packId}:${t.name} at ${schemaAbs}: ${(e as Error).message}`);
+          continue;
+        }
+        try {
+          ajv.compile(schema);
+        } catch (e) {
+          pushErr(`Schema does not compile for ${packId}:${t.name} at ${schemaAbs}: ${(e as Error).message}`);
+          continue;
+        }
+        const props = schema?.properties ? Object.keys(schema.properties) : [];
+        stackTools.push({ packId, toolName: t.name, schemaPath: schemaAbs, props });
+      }
+    }
+
+    // 4) Policies cross-checks (optional if file missing)
+    if (!fs.existsSync(policiesFile)) {
+      pushWarn(`No policies.yaml found at ${policiesFile} (run: ap policies suggest --stack ${opts.stack})`);
+    } else {
+      let pol: Policies | null = null;
+      try {
+        pol = loadYaml<Policies>(policiesFile);
+      } catch (e) {
+        pushErr(`Failed to parse policies.yaml: ${(e as Error).message}`);
+      }
+
+      if (pol) {
+        // Each (pack, tool) should have a rule
+        for (const tr of stackTools) {
+          const rule =
+            pol.rules.find((r) => r.pack === tr.packId && r.tool === tr.toolName) ||
+            pol.rules.find((r) => r.pack.startsWith(tr.packId.split('@')[0] + '@') && r.tool === tr.toolName);
+
+          if (!rule) {
+            pushWarn(`No policy rule for ${tr.packId}:${tr.toolName}`);
+            continue;
+          }
+
+          // allowlist subset of schema props (if allowlist present)
+          if (rule.allowlist && rule.allowlist.length && tr.props.length) {
+            const extras = rule.allowlist.filter(k => !tr.props.includes(k));
+            if (extras.length) {
+              pushWarn(`Policy allowlist has fields not in schema for ${tr.packId}:${tr.toolName}: ${extras.join(', ')}`);
+            }
+          }
+
+          // confirmation heuristic cross-check
+          const locked = lockedById.get(tr.packId);
+          const packYamlPath = locked ? path.join(locked.path, 'pack.yaml') : '';
+          let meta: PackMeta | null = null;
+          try { if (packYamlPath && fs.existsSync(packYamlPath)) meta = loadYaml<PackMeta>(packYamlPath); } catch {}
+          const toolMeta = meta?.tools?.find(tt => tt.name === tr.toolName);
+          const se = (toolMeta?.['x-actionpack']?.side_effects || []).map(s => String(s).toLowerCase());
+          const hasSideEffects = se.some(s => ['send','create','update','delete','write','post'].includes(s));
+
+          if (hasSideEffects && !rule.confirm?.required) {
+            pushWarn(`Side-effecting tool ${tr.packId}:${tr.toolName} should probably require confirmation.`);
+          }
+          if (!hasSideEffects && rule.confirm?.required) {
+            pushWarn(`Non side-effecting tool ${tr.packId}:${tr.toolName} is marked confirm-required (check intent).`);
+          }
+        }
+      }
+    }
+
+    // 5) Print report and exit (errors => code 1)
+    printAndExit();
+  });
+
 program.parseAsync();

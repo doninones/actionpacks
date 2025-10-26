@@ -989,4 +989,145 @@ program
     printAndExit();
   });
 
+/* ---------------------------
+ * packs (list what’s in the stack)
+ * ------------------------- */
+program
+  .command('packs')
+  .description('List packs in the stack with resolved paths')
+  .option('--stack <path>', 'Stack path', 'stacks/it-ops')
+  .action((opts) => {
+    const stackDir = resolveStackDir(opts.stack);
+    const stackFile = path.join(stackDir, 'stack.yaml');
+    const lockFile = path.join(stackDir, 'stack.lock.json');
+
+    if (!fs.existsSync(stackFile) || !fs.existsSync(lockFile)) {
+      console.error(`Missing stack and/or lock. Run 'ap init …' and 'ap add …' first.`);
+      process.exit(1);
+    }
+
+    const stack = loadYaml<StackFile>(stackFile);
+    const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8')) as LockFile;
+
+    if (!stack.packs?.length) {
+      console.log('No packs in this stack.');
+      return;
+    }
+
+    console.log(`Packs in ${stackFile}:\n`);
+    for (const pid of stack.packs) {
+      const locked = lock.packs.find(p => p.id === pid);
+      if (locked) {
+        console.log(`• ${pid}\n   -> ${locked.path}`);
+      } else {
+        console.log(`• ${pid}\n   -> (not in lockfile)`);
+      }
+    }
+  });
+
+/* ---------------------------
+ * remove (drop a pack from the stack + lock)
+ * ------------------------- */
+program
+  .command('remove')
+  .argument('<packId>', 'Pack ID to remove, e.g., issues-basic@1.0.0')
+  .option('--stack <path>', 'Stack path', 'stacks/it-ops')
+  .description('Remove a pack from stack.yaml and stack.lock.json')
+  .action((packId, opts) => {
+    const stackDir = resolveStackDir(opts.stack);
+    const stackFile = path.join(stackDir, 'stack.yaml');
+    const lockPath = path.join(stackDir, 'stack.lock.json');
+
+    if (!fs.existsSync(stackFile)) {
+      console.error(`No stack at ${stackFile}. Run: ap init ${opts.stack}`);
+      process.exit(1);
+    }
+
+    const stack = loadYaml<StackFile>(stackFile);
+    const before = stack.packs?.length || 0;
+    stack.packs = (stack.packs || []).filter(p => p !== packId);
+
+    if (stack.packs.length === before) {
+      console.log(`${packId} was not present in ${stackFile}`);
+    } else {
+      saveYaml(stackFile, stack);
+      console.log(`Removed ${packId} from ${stackFile}`);
+    }
+
+    if (fs.existsSync(lockPath)) {
+      const lock: LockFile = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+      const beforeL = lock.packs.length;
+      lock.packs = lock.packs.filter(p => p.id !== packId);
+      if (lock.packs.length !== beforeL) {
+        fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2), 'utf8');
+        console.log(`Updated ${lockPath}`);
+      }
+    }
+  });
+
+/* ---------------------------
+ * bump (switch a pack version in stack + refresh lock entry)
+ * ------------------------- */
+program
+  .command('bump')
+  .argument('<packIdWithVersion>', 'Pack ID@version, e.g., issues-basic@1.0.1')
+  .option('--stack <path>', 'Stack path', 'stacks/it-ops')
+  .option('--catalog <path>', 'Catalog root', 'catalog')
+  .description('Update a pack version in the stack and lockfile')
+  .action((packIdWithVersion, opts) => {
+    const { name, version } = parsePackId(packIdWithVersion);
+    if (version === 'latest') {
+      console.error('Please specify an explicit version (no "latest").');
+      process.exit(1);
+    }
+
+    const stackDir = resolveStackDir(opts.stack);
+    const stackFile = path.join(stackDir, 'stack.yaml');
+    const lockPath = path.join(stackDir, 'stack.lock.json');
+    if (!fs.existsSync(stackFile)) {
+      console.error(`No stack at ${stackFile}. Run: ap init ${opts.stack}`);
+      process.exit(1);
+    }
+
+    const stack = loadYaml<StackFile>(stackFile);
+    const idx = (stack.packs || []).findIndex(p => p.startsWith(name + '@'));
+    if (idx === -1) {
+      console.error(`Pack ${name}@* not found in stack. Add it first.`);
+      process.exit(1);
+    }
+    stack.packs[idx] = packIdWithVersion;
+    saveYaml(stackFile, stack);
+    console.log(`Updated ${stackFile}`);
+
+    const now = new Date().toISOString();
+    let lock: LockFile = fs.existsSync(lockPath)
+      ? JSON.parse(fs.readFileSync(lockPath, 'utf8'))
+      : { createdAt: now, packs: [] };
+
+    const catalogRoot = findCatalogRoot(opts.catalog || 'catalog');
+    if (!catalogRoot) {
+      console.error('No catalog found (looked in ./catalog and ../../catalog)');
+      process.exit(1);
+    }
+    const idxYaml = loadYaml<CatalogIndex>(path.join(catalogRoot, 'index.yaml'));
+    const hit = idxYaml.packs.find(p => p.id === packIdWithVersion);
+    if (!hit) {
+      console.error(`Version not found in catalog index: ${packIdWithVersion}`);
+      process.exit(1);
+    }
+
+    const resolvedPath = path.join(catalogRoot, hit.path.replace(/^catalog\//, ''));
+    const existing = lock.packs.find(p => p.id.startsWith(name + '@'));
+    if (existing) {
+      existing.id = packIdWithVersion;
+      existing.version = version;
+      existing.path = resolvedPath;
+    } else {
+      lock.packs.push({ id: packIdWithVersion, version, path: resolvedPath });
+    }
+    fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2), 'utf8');
+    console.log(`Updated ${lockPath}`);
+  });
+
+
 program.parseAsync();
